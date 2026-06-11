@@ -1,0 +1,112 @@
+{
+  "name": "05 - Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 340]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Classify error type ──────────────────────────────────\nconst error = $input.first().json;\nconst errorMessage = error.execution?.error?.message || error.error?.message || 'Unknown error';\nconst workflowName = error.workflow?.name || 'Unknown Workflow';\nconst nodeName = error.execution?.lastNodeExecuted || 'Unknown Node';\n\n// Extract ticket_id from the failed execution if available\nlet ticketId = null;\ntry {\n  const execData = error.execution?.data?.resultData?.runData || {};\n  const nodeKeys = Object.keys(execData);\n  for (const key of nodeKeys) {\n    const nodeData = execData[key]?.[0]?.data?.main?.[0]?.[0]?.json;\n    if (nodeData?.ticket_id) {\n      ticketId = nodeData.ticket_id;\n      break;\n    }\n  }\n} catch(e) { /* no ticket id found */ }\n\n// Classify error type\nlet errorType = 'UNKNOWN_ERROR';\nif (/timeout|ETIMEDOUT|ECONNABORTED/i.test(errorMessage))    errorType = 'API_TIMEOUT';\nelse if (/rate.?limit|429|too many requests/i.test(errorMessage)) errorType = 'RATE_LIMIT_ERROR';\nelse if (/postgres|ECONNREFUSED|database/i.test(errorMessage))   errorType = 'DATABASE_ERROR';\nelse if (/groq|openai|llm|classification/i.test(errorMessage))   errorType = 'AI_API_ERROR';\nelse if (/json|parse|invalid/i.test(errorMessage))               errorType = 'INVALID_AI_RESPONSE';\nelse if (/validation/i.test(errorMessage))                        errorType = 'VALIDATION_ERROR';\n\nreturn [{\n  json: {\n    ticket_id:      ticketId,\n    error_type:     errorType,\n    error_message:  errorMessage,\n    workflow_name:  workflowName,\n    node_name:      nodeName,\n    full_error:     JSON.stringify(error),\n    timestamp:      new Date().toISOString(),\n    should_retry:   ['API_TIMEOUT', 'RATE_LIMIT_ERROR', 'AI_API_ERROR'].includes(errorType)\n  }\n}];"
+      },
+      "id": "classify-error",
+      "name": "Code: Classify Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 340]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  {{ $json.ticket_id ? '\\'' + $json.ticket_id + '\\'' : 'NULL' }},\n  'WORKFLOW_FAILED',\n  '{\"error_type\": \"{{ $json.error_type }}\", \"error_message\": {{ JSON.stringify($json.error_message) }}, \"node\": \"{{ $json.node_name }}\"}',\n  '{{ $json.workflow_name }}',\n  '{{ $json.node_name }}'\n);\n\nINSERT INTO failed_jobs (ticket_id, payload, error_type, error_message, workflow_name, node_name)\nVALUES (\n  {{ $json.ticket_id ? '\\'' + $json.ticket_id + '\\'' : 'NULL' }},\n  '{{ $json.full_error.replace(\"'\", \"''\") }}',\n  '{{ $json.error_type }}',\n  '{{ $json.error_message.replace(\"'\", \"''\") }}',\n  '{{ $json.workflow_name }}',\n  '{{ $json.node_name }}'\n);",
+        "options": {}
+      },
+      "id": "pg-log-error",
+      "name": "PostgreSQL: Log Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 340],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "id": "retry-check",
+              "leftValue": "={{ $('Code: Classify Error').item.json.should_retry }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-should-retry",
+      "name": "IF: Should Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WEBHOOK_URL }}/webhook/retry-classify",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "ticket_id",   "value": "={{ $('Code: Classify Error').item.json.ticket_id }}" },
+            { "name": "retry_count", "value": "=0" },
+            { "name": "error_type",  "value": "={{ $('Code: Classify Error').item.json.error_type }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "trigger-retry",
+      "name": "HTTP: Trigger Retry Workflow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 240]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Terminal error — no retry possible\nconst d = $('Code: Classify Error').item.json;\nconsole.log(`[ERROR HANDLER] Terminal failure for ticket ${d.ticket_id}: ${d.error_type} - ${d.error_message}`);\nreturn [{ json: { ...d, terminal: true, message: 'Error logged. No retry scheduled.' } }];"
+      },
+      "id": "terminal-error",
+      "name": "Code: Terminal Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 460]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Code: Classify Error", "type": "main", "index": 0 }]]
+    },
+    "Code: Classify Error": {
+      "main": [[{ "node": "PostgreSQL: Log Error", "type": "main", "index": 0 }]]
+    },
+    "PostgreSQL: Log Error": {
+      "main": [[{ "node": "IF: Should Retry?", "type": "main", "index": 0 }]]
+    },
+    "IF: Should Retry?": {
+      "main": [
+        [{ "node": "HTTP: Trigger Retry Workflow", "type": "main", "index": 0 }],
+        [{ "node": "Code: Terminal Error Handler",  "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "description": "Global error handler. Catches failures from all other workflows, classifies error type, logs to PostgreSQL, and decides whether to retry or terminate.",
+    "version": "1.0.0"
+  }
+}

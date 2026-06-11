@@ -1,0 +1,266 @@
+{
+  "name": "03 - Review & Routing",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket-router",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-router",
+      "name": "Webhook: Receive for Routing",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 340],
+      "webhookId": "ticket-router-webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "confidence-check",
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": 80,
+              "operator": { "type": "number", "operation": "lt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-low-confidence",
+      "name": "IF: Confidence < 80?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 340]
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO human_review_queue\n  (ticket_id, ai_category, ai_priority, ai_confidence, ai_reasoning)\nVALUES (\n  '{{ $json.ticket_id }}',\n  '{{ $json.category }}',\n  '{{ $json.priority }}',\n  {{ $json.confidence }},\n  '{{ $json.reasoning }}'\n);\n\nUPDATE tickets\nSET status = 'NEEDS_REVIEW', updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-human-review",
+      "name": "PostgreSQL: Queue for Human Review",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [720, 200],
+      "credentials": {
+        "postgres": {
+          "id": "pg-tickets-cred",
+          "name": "Support Tickets DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  '{{ $json.ticket_id }}',\n  'REVIEW_TRIGGERED',\n  '{\"ai_confidence\": {{ $json.confidence }}, \"ai_category\": \"{{ $json.category }}\", \"reason\": \"Low confidence threshold\"}',\n  '03 - Review & Routing',\n  'PostgreSQL: Queue for Human Review'\n);",
+        "options": {}
+      },
+      "id": "pg-audit-review",
+      "name": "PostgreSQL: Audit Review Queued",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [940, 200],
+      "credentials": {
+        "postgres": {
+          "id": "pg-tickets-cred",
+          "name": "Support Tickets DB"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            {
+              "conditions": {
+                "options": {},
+                "conditions": [{ "leftValue": "={{ $json.category }}", "rightValue": "Billing", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Billing"
+            },
+            {
+              "conditions": {
+                "options": {},
+                "conditions": [{ "leftValue": "={{ $json.category }}", "rightValue": "Technical Support", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Technical Support"
+            },
+            {
+              "conditions": {
+                "options": {},
+                "conditions": [{ "leftValue": "={{ $json.category }}", "rightValue": "Security", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Security"
+            },
+            {
+              "conditions": {
+                "options": {},
+                "conditions": [{ "leftValue": "={{ $json.category }}", "rightValue": "Sales", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Sales"
+            },
+            {
+              "conditions": {
+                "options": {},
+                "conditions": [{ "leftValue": "={{ $json.category }}", "rightValue": "Account Management", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Account Management"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "switch-category",
+      "name": "Switch: Route by Category",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [720, 480]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET status = 'ROUTED',\n    assigned_queue = 'billing',\n    routed_at = NOW(),\n    updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-route-billing",
+      "name": "PostgreSQL: Route → Billing",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 320],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET status = 'ROUTED',\n    assigned_queue = 'support',\n    routed_at = NOW(),\n    updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-route-support",
+      "name": "PostgreSQL: Route → Support",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 420],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET status = 'ROUTED',\n    assigned_queue = 'security',\n    routed_at = NOW(),\n    updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-route-security",
+      "name": "PostgreSQL: Route → Security",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 520],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET status = 'ROUTED',\n    assigned_queue = 'sales',\n    routed_at = NOW(),\n    updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-route-sales",
+      "name": "PostgreSQL: Route → Sales",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 620],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET status = 'ROUTED',\n    assigned_queue = 'account',\n    routed_at = NOW(),\n    updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-route-account",
+      "name": "PostgreSQL: Route → Account",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 720],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge all routing branches and write a single audit log\nconst d = $input.first().json;\nconst queue = d.assigned_queue || 'unknown';\nreturn [{ json: { ticket_id: d.ticket_id, assigned_queue: queue } }];"
+      },
+      "id": "merge-routes",
+      "name": "Code: Merge Routes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1220, 520]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  '{{ $json.ticket_id }}',\n  'TICKET_ROUTED',\n  '{\"assigned_queue\": \"{{ $json.assigned_queue }}\"}',\n  '03 - Review & Routing',\n  'PostgreSQL: Route → queue'\n);",
+        "options": {}
+      },
+      "id": "pg-audit-routed",
+      "name": "PostgreSQL: Audit Routed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1440, 520],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    }
+  ],
+  "connections": {
+    "Webhook: Receive for Routing": {
+      "main": [[{ "node": "IF: Confidence < 80?", "type": "main", "index": 0 }]]
+    },
+    "IF: Confidence < 80?": {
+      "main": [
+        [{ "node": "PostgreSQL: Queue for Human Review", "type": "main", "index": 0 }],
+        [{ "node": "Switch: Route by Category", "type": "main", "index": 0 }]
+      ]
+    },
+    "PostgreSQL: Queue for Human Review": {
+      "main": [[{ "node": "PostgreSQL: Audit Review Queued", "type": "main", "index": 0 }]]
+    },
+    "Switch: Route by Category": {
+      "main": [
+        [{ "node": "PostgreSQL: Route → Billing", "type": "main", "index": 0 }],
+        [{ "node": "PostgreSQL: Route → Support", "type": "main", "index": 0 }],
+        [{ "node": "PostgreSQL: Route → Security", "type": "main", "index": 0 }],
+        [{ "node": "PostgreSQL: Route → Sales", "type": "main", "index": 0 }],
+        [{ "node": "PostgreSQL: Route → Account", "type": "main", "index": 0 }]
+      ]
+    },
+    "PostgreSQL: Route → Billing":  { "main": [[{ "node": "Code: Merge Routes", "type": "main", "index": 0 }]] },
+    "PostgreSQL: Route → Support":  { "main": [[{ "node": "Code: Merge Routes", "type": "main", "index": 0 }]] },
+    "PostgreSQL: Route → Security": { "main": [[{ "node": "Code: Merge Routes", "type": "main", "index": 0 }]] },
+    "PostgreSQL: Route → Sales":    { "main": [[{ "node": "Code: Merge Routes", "type": "main", "index": 0 }]] },
+    "PostgreSQL: Route → Account":  { "main": [[{ "node": "Code: Merge Routes", "type": "main", "index": 0 }]] },
+    "Code: Merge Routes": {
+      "main": [[{ "node": "PostgreSQL: Audit Routed", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "05-error-handler"
+  },
+  "meta": {
+    "description": "Routes tickets based on AI confidence (human review if <80%) and category (Switch node to department queues). Demonstrates IF branching, Switch routing, and audit logging.",
+    "version": "1.0.0"
+  }
+}

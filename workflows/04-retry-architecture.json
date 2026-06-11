@@ -1,0 +1,203 @@
+{
+  "name": "04 - Retry Architecture",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "retry-classify",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-retry",
+      "name": "Webhook: Retry Entry",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 340],
+      "webhookId": "retry-classify-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst retryCount = d.retry_count || 0;\n\n// Enforce max retries\nif (retryCount >= 3) {\n  throw new Error(`MAX_RETRIES_EXCEEDED: Ticket ${d.ticket_id} has exhausted all ${retryCount} retry attempts.`);\n}\n\nreturn [{ json: { ...d, retry_count: retryCount } }];"
+      },
+      "id": "check-retry-count",
+      "name": "Code: Check Retry Count",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 340]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "id": "retry-1",
+              "leftValue": "={{ $json.retry_count }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-retry-1",
+      "name": "IF: First Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 340]
+    },
+    {
+      "parameters": {
+        "amount": 10,
+        "unit": "seconds"
+      },
+      "id": "wait-10s",
+      "name": "Wait: 10 Seconds",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [900, 240]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "id": "retry-2",
+              "leftValue": "={{ $json.retry_count }}",
+              "rightValue": 1,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-retry-2",
+      "name": "IF: Second Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 440]
+    },
+    {
+      "parameters": {
+        "amount": 30,
+        "unit": "seconds"
+      },
+      "id": "wait-30s",
+      "name": "Wait: 30 Seconds",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1120, 380]
+    },
+    {
+      "parameters": {
+        "amount": 60,
+        "unit": "seconds"
+      },
+      "id": "wait-60s",
+      "name": "Wait: 60 Seconds",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1120, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Increment retry count and re-submit to classification\nconst d = $input.first().json;\nreturn [{ json: { ...d, retry_count: (d.retry_count || 0) + 1 } }];"
+      },
+      "id": "increment-retry",
+      "name": "Code: Increment Retry Count",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET retry_count = {{ $json.retry_count }}, updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';\n\nINSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  '{{ $json.ticket_id }}',\n  'RETRY_ATTEMPTED',\n  '{\"retry_count\": {{ $json.retry_count }}, \"reason\": \"AI classification failure\"}',\n  '04 - Retry Architecture',\n  'Code: Increment Retry Count'\n);",
+        "options": {}
+      },
+      "id": "pg-log-retry",
+      "name": "PostgreSQL: Log Retry Attempt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 420],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WEBHOOK_URL }}/webhook/ai-classify",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "ticket_id",   "value": "={{ $json.ticket_id }}" },
+            { "name": "subject",     "value": "={{ $json.subject }}" },
+            { "name": "message",     "value": "={{ $json.message }}" },
+            { "name": "name",        "value": "={{ $json.name }}" },
+            { "name": "email",       "value": "={{ $json.email }}" },
+            { "name": "retry_count", "value": "={{ $json.retry_count }}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "re-submit-classification",
+      "name": "HTTP: Re-submit to Classification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 420]
+    },
+
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_jobs\n  (ticket_id, payload, error_type, error_message, workflow_name, retry_count, final_failure_reason)\nVALUES (\n  '{{ $json.ticket_id }}',\n  '{{ JSON.stringify($json) }}',\n  'AI_CLASSIFICATION_FAILURE',\n  'Exhausted all retry attempts',\n  '04 - Retry Architecture',\n  {{ $json.retry_count }},\n  'Groq API failed after 3 retry attempts with exponential backoff'\n);\n\nUPDATE tickets\nSET status = 'FAILED', updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';\n\nINSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  '{{ $json.ticket_id }}',\n  'TICKET_DEAD_LETTERED',\n  '{\"retry_count\": {{ $json.retry_count }}, \"reason\": \"Max retries exceeded\"}',\n  '04 - Retry Architecture',\n  'Dead Letter Queue'\n);",
+        "options": {}
+      },
+      "id": "pg-dead-letter",
+      "name": "PostgreSQL: Dead Letter Queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 560],
+      "credentials": { "postgres": { "id": "pg-tickets-cred", "name": "Support Tickets DB" } }
+    }
+  ],
+  "connections": {
+    "Webhook: Retry Entry": {
+      "main": [[{ "node": "Code: Check Retry Count", "type": "main", "index": 0 }]]
+    },
+    "Code: Check Retry Count": {
+      "main": [[{ "node": "IF: First Retry?", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "PostgreSQL: Dead Letter Queue", "type": "main", "index": 0 }]]
+    },
+    "IF: First Retry?": {
+      "main": [
+        [{ "node": "Wait: 10 Seconds", "type": "main", "index": 0 }],
+        [{ "node": "IF: Second Retry?", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF: Second Retry?": {
+      "main": [
+        [{ "node": "Wait: 30 Seconds", "type": "main", "index": 0 }],
+        [{ "node": "Wait: 60 Seconds", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait: 10 Seconds":  { "main": [[{ "node": "Code: Increment Retry Count", "type": "main", "index": 0 }]] },
+    "Wait: 30 Seconds":  { "main": [[{ "node": "Code: Increment Retry Count", "type": "main", "index": 0 }]] },
+    "Wait: 60 Seconds":  { "main": [[{ "node": "Code: Increment Retry Count", "type": "main", "index": 0 }]] },
+    "Code: Increment Retry Count": {
+      "main": [[{ "node": "PostgreSQL: Log Retry Attempt", "type": "main", "index": 0 }]]
+    },
+    "PostgreSQL: Log Retry Attempt": {
+      "main": [[{ "node": "HTTP: Re-submit to Classification", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "description": "Exponential-backoff retry: 10s → 30s → 60s. After 3 failures, moves ticket to Dead Letter Queue in PostgreSQL and sets status=FAILED.",
+    "version": "1.0.0"
+  }
+}

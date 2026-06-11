@@ -1,0 +1,158 @@
+{
+  "name": "01 - Ticket Intake",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-intake",
+      "name": "Webhook: Receive Ticket",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "ticket-intake-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Validate required fields ──────────────────────────────\nconst body = $input.first().json.body || $input.first().json;\nconst required = ['name', 'email', 'subject', 'message'];\nconst missing = required.filter(f => !body[f] || String(body[f]).trim() === '');\n\nif (missing.length > 0) {\n  throw new Error(`Validation failed. Missing fields: ${missing.join(', ')}`);\n}\n\n// Basic email format check\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nif (!emailRegex.test(body.email)) {\n  throw new Error(`Invalid email format: ${body.email}`);\n}\n\nreturn [{ json: { ...body, validated: true } }];"
+      },
+      "id": "validate-fields",
+      "name": "Code: Validate Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Generate unique ticket ID ─────────────────────────────\nconst now = new Date();\nconst datePart = now.toISOString().slice(0,10).replace(/-/g,'');\nconst randomPart = Math.floor(1000 + Math.random() * 9000);\nconst ticketId = `TKT-${datePart}-${randomPart}`;\n\nconst data = $input.first().json;\nreturn [{\n  json: {\n    ticket_id:      ticketId,\n    name:           data.name.trim(),\n    email:          data.email.trim().toLowerCase(),\n    subject:        data.subject.trim(),\n    message:        data.message.trim(),\n    source_channel: data.source_channel || 'webhook',\n    received_at:    now.toISOString()\n  }\n}];"
+      },
+      "id": "generate-ticket-id",
+      "name": "Code: Generate Ticket ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO tickets (ticket_id, name, email, subject, message, source_channel, status)\nVALUES (\n  '{{ $json.ticket_id }}',\n  '{{ $json.name }}',\n  '{{ $json.email }}',\n  '{{ $json.subject }}',\n  '{{ $json.message }}',\n  '{{ $json.source_channel }}',\n  'RECEIVED'\n)\nON CONFLICT (ticket_id) DO NOTHING\nRETURNING id, ticket_id, status, created_at;",
+        "options": {}
+      },
+      "id": "pg-insert-ticket",
+      "name": "PostgreSQL: Insert Ticket",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-tickets-cred",
+          "name": "Support Tickets DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  '{{ $('Code: Generate Ticket ID').item.json.ticket_id }}',\n  'TICKET_RECEIVED',\n  '{\"source\": \"{{ $('Code: Generate Ticket ID').item.json.source_channel }}\", \"email\": \"{{ $('Code: Generate Ticket ID').item.json.email }}\"}',\n  '01 - Ticket Intake',\n  'PostgreSQL: Insert Ticket'\n);",
+        "options": {}
+      },
+      "id": "pg-audit-received",
+      "name": "PostgreSQL: Audit Received",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-tickets-cred",
+          "name": "Support Tickets DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WEBHOOK_URL }}/webhook/ai-classify",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "ticket_id",  "value": "={{ $('Code: Generate Ticket ID').item.json.ticket_id }}" },
+            { "name": "subject",    "value": "={{ $('Code: Generate Ticket ID').item.json.subject }}" },
+            { "name": "message",    "value": "={{ $('Code: Generate Ticket ID').item.json.message }}" },
+            { "name": "name",       "value": "={{ $('Code: Generate Ticket ID').item.json.name }}" },
+            { "name": "email",      "value": "={{ $('Code: Generate Ticket ID').item.json.email }}" }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "trigger-classification",
+      "name": "HTTP: Trigger Classification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": true,\n  \"ticket_id\": \"{{ $('Code: Generate Ticket ID').item.json.ticket_id }}\",\n  \"message\": \"Ticket received and queued for processing\",\n  \"status\": \"RECEIVED\"\n}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "respond-accepted",
+      "name": "Respond: 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1340, 160]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": false,\n  \"error\": \"{{ $json.message }}\",\n  \"status\": \"VALIDATION_FAILED\"\n}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "respond-error",
+      "name": "Respond: 400 Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [680, 480]
+    }
+  ],
+  "connections": {
+    "Webhook: Receive Ticket": {
+      "main": [[{ "node": "Code: Validate Fields", "type": "main", "index": 0 }]]
+    },
+    "Code: Validate Fields": {
+      "main": [[{ "node": "Code: Generate Ticket ID", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Respond: 400 Error", "type": "main", "index": 0 }]]
+    },
+    "Code: Generate Ticket ID": {
+      "main": [
+        [{ "node": "Respond: 202 Accepted", "type": "main", "index": 0 }],
+        [{ "node": "PostgreSQL: Insert Ticket", "type": "main", "index": 0 }]
+      ]
+    },
+    "PostgreSQL: Insert Ticket": {
+      "main": [[{ "node": "PostgreSQL: Audit Received", "type": "main", "index": 0 }]]
+    },
+    "PostgreSQL: Audit Received": {
+      "main": [[{ "node": "HTTP: Trigger Classification", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "any",
+    "errorWorkflow": "05-error-handler"
+  },
+  "meta": {
+    "description": "Receives support tickets via webhook, validates fields, generates ticket ID, persists to PostgreSQL, and triggers AI classification workflow.",
+    "version": "1.0.0"
+  }
+}

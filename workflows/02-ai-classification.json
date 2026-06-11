@@ -1,0 +1,160 @@
+{
+  "name": "02 - AI Classification",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-classify",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-classify",
+      "name": "Webhook: Receive for Classification",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "ai-classify-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Build Groq prompt ────────────────────────────────────\nconst d = $input.first().json;\n\nconst systemPrompt = `You are a customer support ticket classifier for a SaaS company.\nAnalyze the support ticket and return ONLY a valid JSON object — no markdown, no explanation.\n\nClassify into EXACTLY ONE category:\n- Billing\n- Technical Support\n- Sales\n- Security\n- Account Management\n\nAssign EXACTLY ONE priority:\n- Low    (general question, no urgency)\n- Medium (issue affecting work but has workaround)\n- High   (significant business impact, no workaround)\n- Critical (data loss, security breach, complete outage)\n\nconfidence is an integer 0-100 reflecting your certainty.\nreasoning is one concise sentence.\n\nReturn ONLY this JSON structure:\n{\"category\": \"...\", \"priority\": \"...\", \"confidence\": 0, \"reasoning\": \"...\"}`;\n\nconst userPrompt = `Subject: ${d.subject}\\nMessage: ${d.message}`;\n\nreturn [{\n  json: {\n    ticket_id:    d.ticket_id,\n    name:         d.name,\n    email:        d.email,\n    subject:      d.subject,\n    message:      d.message,\n    system_prompt: systemPrompt,\n    user_prompt:   userPrompt,\n    retry_count:   d.retry_count || 0\n  }\n}];"
+      },
+      "id": "build-prompt",
+      "name": "Code: Build Classification Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"model\": \"llama-3.3-70b-versatile\",\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"{{ $json.system_prompt }}\" },\n    { \"role\": \"user\",   \"content\": \"{{ $json.user_prompt }}\" }\n  ],\n  \"temperature\": 0.1,\n  \"max_tokens\": 256,\n  \"response_format\": { \"type\": \"json_object\" }\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "groq-api-call",
+      "name": "HTTP: Groq Classification API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "groq-api-cred",
+          "name": "Groq API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Parse and validate Groq response ────────────────────\nconst groqResponse = $input.first().json;\nconst ticketData = $('Code: Build Classification Prompt').item.json;\n\nlet classification;\ntry {\n  const content = groqResponse.choices[0].message.content;\n  classification = typeof content === 'string' ? JSON.parse(content) : content;\n} catch (e) {\n  throw new Error(`Failed to parse Groq response as JSON: ${e.message}`);\n}\n\n// Validate expected fields\nconst validCategories = ['Billing', 'Technical Support', 'Sales', 'Security', 'Account Management'];\nconst validPriorities = ['Low', 'Medium', 'High', 'Critical'];\n\nif (!validCategories.includes(classification.category)) {\n  throw new Error(`Invalid category from AI: '${classification.category}'. Expected one of: ${validCategories.join(', ')}`);\n}\nif (!validPriorities.includes(classification.priority)) {\n  throw new Error(`Invalid priority from AI: '${classification.priority}'. Expected one of: ${validPriorities.join(', ')}`);\n}\nif (typeof classification.confidence !== 'number' || classification.confidence < 0 || classification.confidence > 100) {\n  throw new Error(`Invalid confidence value: ${classification.confidence}`);\n}\n\nreturn [{\n  json: {\n    ticket_id:    ticketData.ticket_id,\n    name:         ticketData.name,\n    email:        ticketData.email,\n    subject:      ticketData.subject,\n    message:      ticketData.message,\n    category:     classification.category,\n    priority:     classification.priority,\n    confidence:   classification.confidence,\n    reasoning:    classification.reasoning,\n    model_used:   groqResponse.model,\n    raw_response: JSON.stringify(groqResponse)\n  }\n}];"
+      },
+      "id": "parse-classification",
+      "name": "Code: Parse & Validate AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ticket_classifications\n  (ticket_id, category, priority, confidence, reasoning, model_used, raw_response)\nVALUES (\n  '{{ $json.ticket_id }}',\n  '{{ $json.category }}',\n  '{{ $json.priority }}',\n  {{ $json.confidence }},\n  '{{ $json.reasoning }}',\n  '{{ $json.model_used }}',\n  '{{ $json.raw_response }}'\n);\n\nUPDATE tickets\nSET status = 'CLASSIFIED', updated_at = NOW()\nWHERE ticket_id = '{{ $json.ticket_id }}';",
+        "options": {}
+      },
+      "id": "pg-store-classification",
+      "name": "PostgreSQL: Store Classification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-tickets-cred",
+          "name": "Support Tickets DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ticket_audit_logs (ticket_id, event_type, event_data, workflow_name, node_name)\nVALUES (\n  '{{ $('Code: Parse & Validate AI Response').item.json.ticket_id }}',\n  'TICKET_CLASSIFIED',\n  '{\"category\": \"{{ $('Code: Parse & Validate AI Response').item.json.category }}\", \"priority\": \"{{ $('Code: Parse & Validate AI Response').item.json.priority }}\", \"confidence\": {{ $('Code: Parse & Validate AI Response').item.json.confidence }}}',\n  '02 - AI Classification',\n  'PostgreSQL: Store Classification'\n);",
+        "options": {}
+      },
+      "id": "pg-audit-classified",
+      "name": "PostgreSQL: Audit Classified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-tickets-cred",
+          "name": "Support Tickets DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WEBHOOK_URL }}/webhook/ticket-router",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "ticket_id",  "value": "={{ $('Code: Parse & Validate AI Response').item.json.ticket_id }}" },
+            { "name": "category",   "value": "={{ $('Code: Parse & Validate AI Response').item.json.category }}" },
+            { "name": "priority",   "value": "={{ $('Code: Parse & Validate AI Response').item.json.priority }}" },
+            { "name": "confidence", "value": "={{ $('Code: Parse & Validate AI Response').item.json.confidence }}" },
+            { "name": "reasoning",  "value": "={{ $('Code: Parse & Validate AI Response').item.json.reasoning }}" },
+            { "name": "name",       "value": "={{ $('Code: Parse & Validate AI Response').item.json.name }}" },
+            { "name": "email",      "value": "={{ $('Code: Parse & Validate AI Response').item.json.email }}" },
+            { "name": "subject",    "value": "={{ $('Code: Parse & Validate AI Response').item.json.subject }}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "trigger-routing",
+      "name": "HTTP: Trigger Routing Workflow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Receive for Classification": {
+      "main": [[{ "node": "Code: Build Classification Prompt", "type": "main", "index": 0 }]]
+    },
+    "Code: Build Classification Prompt": {
+      "main": [[{ "node": "HTTP: Groq Classification API", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Groq Classification API": {
+      "main": [[{ "node": "Code: Parse & Validate AI Response", "type": "main", "index": 0 }]]
+    },
+    "Code: Parse & Validate AI Response": {
+      "main": [[{ "node": "PostgreSQL: Store Classification", "type": "main", "index": 0 }]]
+    },
+    "PostgreSQL: Store Classification": {
+      "main": [[{ "node": "PostgreSQL: Audit Classified", "type": "main", "index": 0 }]]
+    },
+    "PostgreSQL: Audit Classified": {
+      "main": [[{ "node": "HTTP: Trigger Routing Workflow", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "05-error-handler"
+  },
+  "meta": {
+    "description": "Receives classified ticket data, calls Groq LLM API, validates JSON response, stores classification in PostgreSQL, and triggers routing workflow.",
+    "version": "1.0.0"
+  }
+}
