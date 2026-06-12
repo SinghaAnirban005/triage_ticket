@@ -342,25 +342,10 @@ ai-support-triage/
 
 ---
 
-## 📸 Screenshots to Capture
-
-For your portfolio, capture these views in n8n:
-
-- [ ] WF01 full canvas — intake flow
-- [ ] WF02 — Groq API node configuration
-- [ ] WF03 — IF node (confidence branch) + Switch node (category routing)
-- [ ] WF04 — Retry chain with Wait nodes
-- [ ] WF05 — Error Trigger + classification code
-- [ ] PostgreSQL: `v_ticket_summary` with real data
-- [ ] Execution history showing successful + failed runs
-- [ ] `human_review_queue` table with pending reviews
-
----
-
 ## 📄 License
 
 MIT — use freely for portfolios and learning.
 
 ---
 
-*Built with n8n, Groq, PostgreSQL — demonstrating production-grade automation engineering.*
+*Built with n8n, Groq, PostgreSQL*
